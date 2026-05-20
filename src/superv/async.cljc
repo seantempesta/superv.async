@@ -24,7 +24,26 @@
    :cljs (defn now []
            (js/Date.)))
 
-(defrecord TrackingSupervisor [error aborts registered pending-exceptions]
+(defrecord TrackingSupervisor [error aborts registered pending-exceptions
+                               ;; Atom holding the lazy watchdog-starter:
+                               ;;  - initial value: a 0-arg fn that starts the
+                               ;;    self-rescheduling stale-pending watchdog,
+                               ;;    then resets the atom to nil.
+                               ;;  - after first track: nil (so subsequent
+                               ;;    -track-exception calls are cheap and do
+                               ;;    not start additional watchdogs).
+                               ;; Rationale: the original implementation
+                               ;; started the watchdog inside simple-supervisor
+                               ;; at construction time. On the JVM that's
+                               ;; harmless; under wasm-rquickjs invoked from
+                               ;; wstd::runtime::block_on (e.g. wasmtime CLI's
+                               ;; `run --invoke`), block_on drains pending JS
+                               ;; timers before returning — so a perpetual
+                               ;; setTimeout chain deadlocks the host. Lazy
+                               ;; start means namespace-load is timer-free,
+                               ;; and the watchdog still kicks in the moment a
+                               ;; real channel exception needs surfacing.
+                               watchdog-starter]
   PSupervisor
   (-error [this] error)
   ;; HACK: avoid too many pending takes on a single abort-ch
@@ -39,85 +58,71 @@
   (-unregister-go [this id]
     (swap! registered dissoc id))
   (-track-exception [this e]
-    (swap! pending-exceptions assoc e (now)))
+    (swap! pending-exceptions assoc e (now))
+    (when-let [start (and watchdog-starter @watchdog-starter)]
+      ;; CAS: only one thread/turn actually starts the watchdog. Other
+      ;; concurrent -track-exception calls see nil and skip.
+      (when (compare-and-set! watchdog-starter start nil)
+        (start))))
   (-free-exception [this e]
     (swap! pending-exceptions dissoc e)))
 
 (def ^:const NUM_ABORT_CHANS 1000)
 
-#?(:cljs
-   (defn ^:private stale-watchdog-enabled?
-     "True unless the host opts out via `globalThis.superv_async_no_stale_watchdog`.
-
-     The stale-pending-exception watchdog reschedules itself every
-     `stale-timeout` ms via `setTimeout` for the lifetime of the JS runtime.
-
-     - Under Node.js, that's invisible: Node keeps the process alive on its
-       event loop, prints intermediate output as it runs, and exits on
-       process exit anyway.
-     - Under wasm-rquickjs invoked from a `wstd::runtime::block_on` host
-       (e.g. wasmtime CLI's `run --invoke`), `block_on` drains the JS
-       runtime until there are no pending timers/promises. A perpetual
-       self-rescheduling `setTimeout` chain means `block_on` never
-       returns — the invoke hangs.
-
-     Sacrifice: with the watchdog off, exceptions that nobody ever takes
-     off a supervised channel will sit in `:pending-exceptions` forever
-     instead of being surfaced to `error-fn` after `stale-timeout`. This
-     only matters when a downstream caller forgets to consume a channel
-     containing an exception — a programming bug, not a runtime feature.
-
-     Set `globalThis.superv_async_no_stale_watchdog = true` before
-     anything requires superv.async (or set it as a Closure compile-time
-     define) to opt out. Hosts running under wstd/wasmtime invoke MUST
-     opt out or namespace load will deadlock the runtime."
-     []
-     (not (true? (unchecked-get js/globalThis "superv_async_no_stale_watchdog")))))
-
 (defn simple-supervisor
   "A simple supervisor which deals with errors through callbacks. You need to
   close its abort channel manually if you want the context to stop. It is
   supposed to be used at a boundary to an unsupervised system. If you want
-  strong supervision, use the restarting-supervisor instead."
+  strong supervision, use the restarting-supervisor instead.
+
+  The stale-pending-exception watchdog is started LAZILY on the first
+  -track-exception call (i.e. the first time anything actually has an
+  exception to track). Before that, this supervisor schedules no timers
+  and is safe to construct in environments where a perpetual setTimeout
+  chain would deadlock the host (wasm-rquickjs + wstd::runtime::block_on,
+  e.g. wasmtime CLI's `run --invoke`)."
   [& {:keys [stale-timeout error-fn pending-fn]
       :or {stale-timeout (* 10 1000)
            error-fn (fn [e] (println "Supervisor:" e
                                      #?(:cljs (.-stack e))))}}]
-  (let [s (map->TrackingSupervisor {:error (chan)
-                                    :aborts (vec (repeatedly NUM_ABORT_CHANS #(promise-chan)))
-                                    :registered (atom {})
-                                    :pending-exceptions (atom {})})
-        err-ch (:error s)]
-
+  (let [pending-exceptions (atom {})
+        watchdog-starter (atom nil)
+        s (map->TrackingSupervisor
+           {:error              (chan)
+            :aborts             (vec (repeatedly NUM_ABORT_CHANS #(promise-chan)))
+            :registered         (atom {})
+            :pending-exceptions pending-exceptions
+            :watchdog-starter   watchdog-starter})
+        err-ch (:error s)
+        ;; Self-rescheduling watchdog body. Started on demand from inside
+        ;; -track-exception via the watchdog-starter atom. Once running, it
+        ;; behaves exactly like the original eager watchdog.
+        watchdog-fn
+        #?(:cljs
+           (fn pending [_]
+             (let [[[e _]] (filter (fn [[_k v]]
+                                     (> (- (.getTime (now)) stale-timeout)
+                                        (.getTime v)))
+                                   @pending-exceptions)]
+               (when e
+                 (error-fn e)
+                 (-free-exception s e))
+               (take! (timeout stale-timeout) pending)))
+           :clj
+           (fn pending [_]
+             (let [[[e _]] (filter (fn [[_k v]]
+                                     (> (- (.getTime (now)) stale-timeout)
+                                        (.getTime ^java.util.Date v)))
+                                   @pending-exceptions)]
+               (when e
+                 (error-fn e)
+                 (-free-exception s e))
+               (take! (timeout stale-timeout) pending))))]
+    (reset! watchdog-starter (fn start-watchdog [] (watchdog-fn nil)))
     ;; avoid using go-loops with aot here
     (take! err-ch (fn loop-fn [e]
                     (error-fn e)
                     (take! err-ch loop-fn)))
-    ;; Stale-pending-exception watchdog. Self-reschedules forever via
-    ;; (timeout stale-timeout). On the JVM, that's fine; under
-    ;; wasm-rquickjs + wstd::runtime::block_on it prevents the runtime
-    ;; from ever returning. See `stale-watchdog-enabled?` doc.
-    #?(:cljs
-       (when (stale-watchdog-enabled?)
-         ((fn pending [_]
-            (let [[[e _]] (filter (fn [[_k v]]
-                                    (> (- (.getTime (now)) stale-timeout)
-                                       (.getTime v)))
-                                  @(:pending-exceptions s))]
-              (when e
-                (error-fn e)
-                (-free-exception s e))
-              (take! (timeout stale-timeout) pending))) nil))
-       :clj
-       ((fn pending [_]
-          (let [[[e _]] (filter (fn [[_k v]]
-                                  (> (- (.getTime (now)) stale-timeout)
-                                     (.getTime ^java.util.Date v)))
-                                @(:pending-exceptions s))]
-            (when e
-              (error-fn e)
-              (-free-exception s e))
-            (take! (timeout stale-timeout) pending))) nil))
     s))
 
 (defn dummy-supervisor []
