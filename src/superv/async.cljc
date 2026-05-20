@@ -45,6 +45,35 @@
 
 (def ^:const NUM_ABORT_CHANS 1000)
 
+#?(:cljs
+   (defn ^:private stale-watchdog-enabled?
+     "True unless the host opts out via `globalThis.superv_async_no_stale_watchdog`.
+
+     The stale-pending-exception watchdog reschedules itself every
+     `stale-timeout` ms via `setTimeout` for the lifetime of the JS runtime.
+
+     - Under Node.js, that's invisible: Node keeps the process alive on its
+       event loop, prints intermediate output as it runs, and exits on
+       process exit anyway.
+     - Under wasm-rquickjs invoked from a `wstd::runtime::block_on` host
+       (e.g. wasmtime CLI's `run --invoke`), `block_on` drains the JS
+       runtime until there are no pending timers/promises. A perpetual
+       self-rescheduling `setTimeout` chain means `block_on` never
+       returns — the invoke hangs.
+
+     Sacrifice: with the watchdog off, exceptions that nobody ever takes
+     off a supervised channel will sit in `:pending-exceptions` forever
+     instead of being surfaced to `error-fn` after `stale-timeout`. This
+     only matters when a downstream caller forgets to consume a channel
+     containing an exception — a programming bug, not a runtime feature.
+
+     Set `globalThis.superv_async_no_stale_watchdog = true` before
+     anything requires superv.async (or set it as a Closure compile-time
+     define) to opt out. Hosts running under wstd/wasmtime invoke MUST
+     opt out or namespace load will deadlock the runtime."
+     []
+     (not (true? (unchecked-get js/globalThis "superv_async_no_stale_watchdog")))))
+
 (defn simple-supervisor
   "A simple supervisor which deals with errors through callbacks. You need to
   close its abort channel manually if you want the context to stop. It is
@@ -64,17 +93,31 @@
     (take! err-ch (fn loop-fn [e]
                     (error-fn e)
                     (take! err-ch loop-fn)))
-    ((fn pending [_]
-       (let [[[e _]] (filter (fn [[k v]]
-                               (> (- (.getTime (now)) stale-timeout)
-                                  #?(:clj (.getTime ^java.util.Date v)
-                                     :cljs (.getTime v))))
-                             @(:pending-exceptions s))]
-
-         (when e
-           (error-fn e)
-           (-free-exception s e))
-         (take! (timeout stale-timeout) pending))) nil)
+    ;; Stale-pending-exception watchdog. Self-reschedules forever via
+    ;; (timeout stale-timeout). On the JVM, that's fine; under
+    ;; wasm-rquickjs + wstd::runtime::block_on it prevents the runtime
+    ;; from ever returning. See `stale-watchdog-enabled?` doc.
+    #?(:cljs
+       (when (stale-watchdog-enabled?)
+         ((fn pending [_]
+            (let [[[e _]] (filter (fn [[_k v]]
+                                    (> (- (.getTime (now)) stale-timeout)
+                                       (.getTime v)))
+                                  @(:pending-exceptions s))]
+              (when e
+                (error-fn e)
+                (-free-exception s e))
+              (take! (timeout stale-timeout) pending))) nil))
+       :clj
+       ((fn pending [_]
+          (let [[[e _]] (filter (fn [[_k v]]
+                                  (> (- (.getTime (now)) stale-timeout)
+                                     (.getTime ^java.util.Date v)))
+                                @(:pending-exceptions s))]
+            (when e
+              (error-fn e)
+              (-free-exception s e))
+            (take! (timeout stale-timeout) pending))) nil))
     s))
 
 (defn dummy-supervisor []
