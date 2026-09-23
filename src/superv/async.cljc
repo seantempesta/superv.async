@@ -113,8 +113,8 @@
   exception, passing though ex-data if any, and throws it. The wrapping is done
   to maintain a full stack trace when jumping between multiple contexts."
   [x]
-  (if (instance? #?(:clj Exception :cljs js/Error) x)
-    (throw (ex-info (or #?(:clj (.getMessage ^Exception x)
+  (if (instance? #?(:clj Throwable :cljs js/Error) x)
+    (throw (ex-info (or #?(:clj (.getMessage ^Throwable x)
                            :cljs (.-message x))
                         (str x))
                     (or (ex-data x) {})
@@ -146,9 +146,9 @@
   exception, passing though ex-data if any, and throws it. The wrapping is done
   to maintain a full stack trace when jumping between multiple contexts."
   [S x]
-  (if (instance? #?(:clj Exception :cljs js/Error) x)
+  (if (instance? #?(:clj Throwable :cljs js/Error) x)
     (do (-free-exception S x)
-        (throw (ex-info (or #?(:clj (.getMessage ^Exception x)
+        (throw (ex-info (or #?(:clj (.getMessage ^Throwable x)
                                :cljs (.-message x)) (str x))
                         (or (ex-data x) {})
                         x)))
@@ -196,7 +196,7 @@
                                {:body exps
                                 :finally-clauses finally})))
            finally (rest (first finally))
-           e (if (:ns &env) `js/Error `Exception)]
+           e (if (:ns &env) `js/Error `Throwable)]
        `(go
           (try
             ~@body
@@ -227,7 +227,7 @@
                             {:body exps
                              :finally-clauses finally})))
         finally (rest (first finally))
-        e (if (:ns &env) `js/Error `Exception)]
+        e (if (:ns &env) `js/Error `Throwable)]
     `(let [supervisor# ~S
            _#          (check-supervisor supervisor#)
            id#         (-register-go supervisor# (quote ~exps))]
@@ -346,7 +346,7 @@ deal with abortion."
   ([S port fn1 on-caller?]
    (async/take! port
                 (fn [v]
-                  (when (instance? #?(:clj Exception :cljs js/Error) v)
+                  (when (instance? #?(:clj Throwable :cljs js/Error) v)
                     (-free-exception S v))
                   (fn1 v))
                 on-caller?)))
@@ -368,7 +368,7 @@ deal with abortion."
    (async/put! port
                val
                (fn [ret]
-                 (when (and (instance? #?(:clj Exception :cljs js/Error) val)
+                 (when (and (instance? #?(:clj Throwable :cljs js/Error) val)
                             (not (= (:type (ex-data val))
                                     :aborted)))
                    (-track-exception S val))
@@ -522,7 +522,7 @@ Throws if any result is an exception or the context has been aborted."
        (go-try S
                (loop []
                  (when-let [obj (<? S in-ch)]
-                   (if (instance? #?(:clj Exception :cljs js/Error) obj)
+                   (if (instance? #?(:clj Throwable :cljs js/Error) obj)
                      (do
                        (>? S out-ch obj)
                        (async/close! out-ch))
@@ -550,7 +550,7 @@ Throws if any result is an exception or the context has been aborted."
   (let [result (chan)]
     (go-loop-try S [acc acc]
                  (if-let [x (<? S ch)]
-                   (if (instance? #?(:clj Exception :cljs js/Error) x)
+                   (if (instance? #?(:clj Throwable :cljs js/Error) x)
                      (do
                        (>? S result x)
                        (async/close! result))
@@ -587,7 +587,7 @@ Throws if any result is an exception or the context has been aborted."
   (let [out-ch (or out-ch (chan))]
     (go-loop-try S [batch []]
                  (if-let [obj (<? S in-ch)]
-                   (if (instance? #?(:clj Exception :cljs js/Error) obj)
+                   (if (instance? #?(:clj Throwable :cljs js/Error) obj)
           ; exception - put on output and close
                      (do (>? S out-ch obj)
                          (async/close! out-ch))
@@ -610,7 +610,7 @@ Throws if any result is an exception or the context has been aborted."
 (defn count>
   "Counts items in a channel. Returns a channel with the item count."
   [S ch]
-  (async/reduce (fn [acc obj] (if (instance? #?(:clj Exception :cljs js/Error) obj)
+  (async/reduce (fn [acc obj] (if (instance? #?(:clj Throwable :cljs js/Error) obj)
                                 (put? S (-error S) obj)
                                 (inc acc))) 0 ch))
 
@@ -681,7 +681,7 @@ Throws if any result is an exception or the context has been aborted."
                                      {:body            exps
                                       :finally-clauses finally})))
            finally (rest (first finally))
-           e (if (:ns &env) `js/Error `Exception)]
+           e (if (:ns &env) `js/Error `Throwable)]
        `(let [supervisor# ~S
               _#          (check-supervisor supervisor#)
               id#         (-register-go supervisor# (quote ~body))]
@@ -794,7 +794,7 @@ Throws if any result is an exception or the context has been aborted."
                                            (when-first [~bind ~gxs]
                                              ~(do-mod mod-pairs)))))))
            res-ch (gensym "res_ch__")
-           e (if (:ns &env) `js/Error `Exception)]
+           e (if (:ns &env) `js/Error `Throwable)]
        `(let [~res-ch (chan)
               iter# ~(emit-bind res-ch (to-groups seq-exprs))]
           (go (try (<? ~S (iter# ~(second seq-exprs)))

@@ -452,3 +452,18 @@
                                    (go-try S (+ res s)))
                                0
                                (range 10)))))))
+
+#?(:clj
+   (deftest an-error-inside-go-try-arrives-at-the-reader-as-a-throw
+     ;; An Error (OutOfMemoryError, AssertionError, StackOverflowError) used to
+     ;; escape go-try-, close its channel, and reach <?- as nil: a failed write
+     ;; read as a successful one.
+     (testing "go-try- with <?-"
+       (let [outer (go-try- (<?- (go-try- (throw (AssertionError. "inner Error")))))
+             result (<!! outer)]
+         (is (instance? Throwable result))
+         (is (instance? AssertionError (.getCause ^Throwable result)))))
+     (testing "go-try with <?"
+       (let [outer (go-try S (<? S (go-try S (throw (AssertionError. "inner Error")))))
+             result (<!! outer)]
+         (is (instance? Throwable result))))))
