@@ -39,7 +39,9 @@
   (-unregister-go [this id]
     (swap! registered dissoc id))
   (-track-exception [this e]
-    (swap! pending-exceptions assoc e (now)))
+    (swap! pending-exceptions assoc e (now))
+    ;; a simple-supervisor sweeps for stale exceptions only while one is pending (:arm-sweep)
+    (when-let [arm (:arm-sweep this)] (arm)))
   (-free-exception [this e]
     (swap! pending-exceptions dissoc e)))
 
@@ -88,18 +90,29 @@
     (take! err-ch (fn loop-fn [e]
                     (error-fn e)
                     (take! err-ch loop-fn)))
-    ((fn pending [_]
-       (let [[[e _]] (filter (fn [[k v]]
-                               (> (- (.getTime (now)) stale-timeout)
-                                  #?(:clj (.getTime ^java.util.Date v)
-                                     :cljs (.getTime v))))
-                             @(:pending-exceptions s))]
-
-         (when e
-           (error-fn e)
-           (-free-exception s e))
-         (schedule-stale-check! stale-timeout pending))) nil)
-    s))
+    ;; The stale-exception sweep runs while an exception is pending, and only then: armed when one
+    ;; is tracked and none is armed, re-armed after a sweep while any is left. It used to re-arm
+    ;; itself every stale-timeout for the life of the process whatever was pending, and S below is
+    ;; a top-level def, so requiring this namespace kept a timer pending forever: a process that
+    ;; was otherwise idle was never idle (a runtime that tells a process nothing can wake it never
+    ;; could, and an idle program woke every 10 s for nothing).
+    (let [armed (atom false)
+          pending-ex (:pending-exceptions s)]
+      (letfn [(arm! []
+                (when (compare-and-set! armed false true)
+                  (schedule-stale-check! stale-timeout sweep)))
+              (sweep [_]
+                (reset! armed false)
+                (let [[[e _]] (filter (fn [[k v]]
+                                        (> (- (.getTime (now)) stale-timeout)
+                                           #?(:clj (.getTime ^java.util.Date v)
+                                              :cljs (.getTime v))))
+                                      @pending-ex)]
+                  (when e
+                    (error-fn e)
+                    (-free-exception s e))
+                  (when (seq @pending-ex) (arm!))))]
+        (assoc s :arm-sweep arm!)))))
 
 (defn dummy-supervisor []
   (map->TrackingSupervisor
